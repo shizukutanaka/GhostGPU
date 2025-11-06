@@ -10,15 +10,177 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import re
+import stat
+import subprocess
 import sys
+import threading
+import warnings
 import cProfile
 import pstats
 from io import StringIO
 import concurrent.futures
-from dataclasses import dataclass
+import ctypes
+import time
+import weakref
+from collections import deque
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 import numpy as np
+import logging
+from logging import handlers as logging_handlers
+
+logger = logging.getLogger(__name__)
+
+# Constants
+DEFAULT_MEMORY_LIMIT_MB = 2048
+
+
+class MemoryTracker:
+    """Track and manage memory allocation with limits."""
+
+    def __init__(self, limit_mb: int = DEFAULT_MEMORY_LIMIT_MB):
+        """
+        Initialize memory tracker.
+
+        Parameters
+        ----------
+        limit_mb : int
+            Memory limit in megabytes
+        """
+        self.limit_mb = limit_mb
+        self.limit_bytes = limit_mb * 1024 * 1024
+        self.allocated_bytes = 0
+        self.peak_bytes = 0
+
+    def allocate(self, size_bytes: int) -> bool:
+        """
+        Try to allocate memory.
+
+        Parameters
+        ----------
+        size_bytes : int
+            Size in bytes to allocate
+
+        Returns
+        -------
+        bool
+            True if allocation succeeded, False if exceeded limit
+        """
+        if self.allocated_bytes + size_bytes > self.limit_bytes:
+            logger.warning(f"Memory allocation would exceed limit: {self.allocated_bytes + size_bytes} > {self.limit_bytes}")
+            return False
+        self.allocated_bytes += size_bytes
+        self.peak_bytes = max(self.peak_bytes, self.allocated_bytes)
+        return True
+
+    def deallocate(self, size_bytes: int) -> None:
+        """
+        Deallocate memory.
+
+        Parameters
+        ----------
+        size_bytes : int
+            Size in bytes to deallocate
+        """
+        self.allocated_bytes = max(0, self.allocated_bytes - size_bytes)
+
+    def get_usage(self) -> Dict[str, float]:
+        """
+        Get memory usage information.
+
+        Returns
+        -------
+        dict
+            Memory usage statistics
+        """
+        return {
+            'allocated_mb': self.allocated_bytes / (1024 * 1024),
+            'peak_mb': self.peak_bytes / (1024 * 1024),
+            'limit_mb': self.limit_mb,
+            'usage_percent': (self.allocated_bytes / self.limit_bytes * 100) if self.limit_bytes > 0 else 0,
+        }
+
+
+class RandomModule:
+    """Random number generation module."""
+
+    def __init__(self, runtime: 'GhostRuntime'):
+        """Initialize random module."""
+        self.runtime = runtime
+        self._rng = np.random.RandomState()
+
+    def randn(self, *shape: int) -> 'ManagedArray':
+        """Generate random normal distribution."""
+        arr = self._rng.randn(*shape)
+        return self.runtime._wrap(arr)
+
+    def rand(self, *shape: int) -> 'ManagedArray':
+        """Generate random uniform distribution."""
+        arr = self._rng.rand(*shape)
+        return self.runtime._wrap(arr)
+
+    def randint(self, low: int, high: int, size: Optional[Sequence[int]] = None) -> 'ManagedArray':
+        """Generate random integers."""
+        arr = self._rng.randint(low, high, size)
+        return self.runtime._wrap(arr)
+
+    def seed(self, seed: int) -> None:
+        """Set random seed."""
+        self._rng.seed(seed)
+
+
+class ManagedArray:
+    """Array with automatic memory tracking and cleanup."""
+
+    def __init__(self, data: np.ndarray, memory_tracker: MemoryTracker):
+        """
+        Initialize managed array.
+
+        Parameters
+        ----------
+        data : np.ndarray
+            NumPy array
+        memory_tracker : MemoryTracker
+            Memory tracker instance
+        """
+        self.data = data
+        self.memory_tracker = memory_tracker
+        size_bytes = data.nbytes
+        if not self.memory_tracker.allocate(size_bytes):
+            logger.warning(f"Failed to allocate {size_bytes} bytes")
+        self._size_bytes = size_bytes
+
+    def numpy(self) -> np.ndarray:
+        """Get underlying NumPy array."""
+        return self.data
+
+    def __array__(self) -> np.ndarray:
+        """NumPy array interface."""
+        return self.data
+
+    def release(self) -> None:
+        """Release memory."""
+        if self._size_bytes > 0:
+            self.memory_tracker.deallocate(self._size_bytes)
+            self._size_bytes = 0
+
+    def __del__(self):
+        """Cleanup on deletion."""
+        self.release()
+
+    def __enter__(self):
+        """Context manager entry."""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit."""
+        self.release()
+
 
 @dataclass
 class PinnedMemory:
@@ -54,24 +216,12 @@ class Backend:
 
     def transfer_batch_to_device(self, batch: list) -> list:
         """Parallel transfer of batch data to device."""
-        pr = cProfile.Profile()
-        pr.enable()
         with concurrent.futures.ThreadPoolExecutor() as executor:
             results = list(executor.map(self.transfer_to_device, batch))
-        pr.disable()
-        s = StringIO()
-        sortby = pstats.SortKey.CUMULATIVE
-        ps = pstats.Stats(pr, stream=s).sort_stats(sortby)
-        ps.print_stats()
-        print(s.getvalue())
         return results
 
     def transfer_batch_from_device(self, batch: list) -> list:
         """Parallel transfer of batch data from device."""
-        import pickle
-        import os
-        pr = cProfile.Profile()
-        pr.enable()
         with concurrent.futures.ThreadPoolExecutor() as executor:
             results = list(executor.map(self.transfer_from_device, batch))
         return results
@@ -287,6 +437,7 @@ __all__ = [
     "array_fp16",
     "array_bf16",
     "MLTrainingOptimizer",
+]
 
 RUNTIME_NAME = "GhostGPU"
 DEFAULT_MEMORY_LIMIT_MB = 512.0
@@ -596,175 +747,66 @@ def benchmark(size: int = 1024) -> Dict[str, Any]:
     return report
 
 
-# CLI --------------------------------------------------------------
-def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=f"{RUNTIME_NAME} runtime utility")
-    parser.add_argument("--info", action="store_true", help="Show runtime information")
-    parser.add_argument("--benchmark", metavar="N", type=int, help="Run a CPU benchmark of size N", default=None)
-    parser.add_argument("--set-memory", metavar="MB", type=float, help="Configure soft memory limit")
-    parser.add_argument("--export-info", metavar="FILE", type=Path, help="Write runtime info as JSON")
-    return parser
-
-
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = _build_parser()
-    args = parser.parse_args(argv)
-
-    if args.set_memory is not None:
-        configure_memory_limit(args.set_memory)
-
-    if args.info:
-        info = get_info()
-        print(json.dumps(info, indent=2))
-
-        if args.export_info:
-            args.export_info.parent.mkdir(parents=True, exist_ok=True)
-            args.export_info.write_text(json.dumps(info, indent=2), encoding="utf-8")
-
-    if args.benchmark is not None:
-        result = benchmark(args.benchmark)
-        print(json.dumps(result, indent=2))
-
-    if not any([args.info, args.benchmark is not None]):
-        parser.print_help()
-        return 1
-
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
-        return self.array(np_result, dtype=np_result.dtype)
-
-    def arange(self, start=None, stop=None, step=1, dtype=None):
-        if start is None and stop is None:
-            raise ValueError("At least one of start or stop must be provided")
-        if stop is None:
-            stop = start
-            start = 0
-        return self.array(np.arange(start, stop, step, dtype=dtype))
-
-    def sort(self, a, axis=-1, kind='quicksort', order=None):
-        if not hasattr(a, '__array__'): a = self.array(a)
-        np_result = np.sort(np.asarray(a), axis=axis, kind=kind, order=order)
-        return self.array(np_result, dtype=a.dtype)
-
-    def argsort(self, a, axis=-1, kind='quicksort', order=None):
-        if not hasattr(a, '__array__'): a = self.array(a)
-        np_result = np.argsort(np.asarray(a), axis=axis, kind=kind, order=order)
-        return self.array(np_result, dtype=np.int64)
-
-    def argmax(self, a, axis=None, keepdims=False):
-        if not hasattr(a, '__array__'): a = self.array(a)
-        np_result = np.argmax(np.asarray(a), axis=axis, keepdims=keepdims)
-        return self.array(np_result, dtype=np.int64)
-
-    def argmin(self, a, axis=None, keepdims=False):
-        if not hasattr(a, '__array__'): a = self.array(a)
-        np_result = np.argmin(np.asarray(a), axis=axis, keepdims=keepdims)
-        return self.array(np_result, dtype=np.int64)
-
-    def unique(self, ar, return_index=False, return_inverse=False, return_counts=False, axis=None, equal_nan=True):
-        if not hasattr(ar, '__array__'):
-            ar = self.array(ar)
-        result = np.unique(np.asarray(ar), return_index=return_index, return_inverse=return_inverse, return_counts=return_counts, axis=axis, equal_nan=equal_nan)
-        if isinstance(result, tuple):
-            return tuple(self.array(x) for x in result)
-        else:
-            return self.array(result)
-
-    def save(self, file, arr, allow_pickle=True, fix_imports=True):
-        if not hasattr(arr, '__array__'):
-            arr = self.array(arr)
-        np_arr = np.asarray(arr)
-        if hasattr(np_arr, 'dtype') and np_arr.dtype.hasobject:
-            if not allow_pickle:
-                raise ValueError("Cannot save object arrays without allowing pickle")
-            import warnings
-            warnings.warn("Saving object arrays with pickle enabled. "
-                         "Ensure data comes from trusted sources when loading.",
-                         SecurityWarning)
-        np.save(file, np_arr, allow_pickle=allow_pickle, fix_imports=fix_imports)
-
-    def load(self, file, mmap_mode=None, allow_pickle=False, fix_imports=True, encoding='ASCII'):
-        np_result = np.load(file, mmap_mode=mmap_mode, allow_pickle=allow_pickle,
-                           fix_imports=fix_imports, encoding=encoding)
-        if isinstance(np_result, np.ndarray):
-            return self.array(np_result, dtype=np_result.dtype)
-        else:
-            return np_result
-
-    class random:
-        """Nested random module to be accessed via ghost.random"""
-        def __init__(self, outer_instance):
-            self.outer = outer_instance
-
-        def rand(self, *args):
-            np_result = np.random.rand(*args)
-            return self.outer.array(np_result, dtype=np_result.dtype)
-
-        def randn(self, *args):
-            np_result = np.random.randn(*args)
-            return self.outer.array(np_result, dtype=np_result.dtype)
-
-        def randint(self, low, high=None, size=None, dtype=np.int64):
-            np_result = np.random.randint(low, high, size, dtype)
-            return self.outer.array(np_result, dtype=np_result.dtype)
-
-        def uniform(self, low=0.0, high=1.0, size=None):
-            np_result = np.random.uniform(low, high, size)
-            return self.outer.array(np_result, dtype=np_result.dtype)
-
-        def normal(self, loc=0.0, scale=1.0, size=None):
-            np_result = np.random.normal(loc, scale, size)
-            return self.outer.array(np_result, dtype=np_result.dtype)
-
-        def seed(self, seed=None):
-            np.random.seed(seed)
-
 # Singleton instance management
+
+def _get_env_int(env_var: str, default: int, min_value: int = 0, max_value: int = 2**63 - 1) -> int:
+    """
+    Get integer environment variable with bounds checking.
+
+    Parameters
+    ----------
+    env_var : str
+        Environment variable name
+    default : int
+        Default value if not set
+    min_value : int
+        Minimum allowed value
+    max_value : int
+        Maximum allowed value
+
+    Returns
+    -------
+    int
+        Environment value or default, clamped to [min_value, max_value]
+    """
+    try:
+        value = int(os.environ.get(env_var, default))
+        return max(min_value, min(value, max_value))
+    except (ValueError, TypeError):
+        return default
+
+
+def _resolve_cache_dir(env_value: Optional[str]) -> Path:
+    """
+    Resolve cache directory from environment or use safe default.
+
+    Parameters
+    ----------
+    env_value : Optional[str]
+        Value from GHOSTGPU_CACHE_DIR environment variable
+
+    Returns
+    -------
+    Path
+        Resolved cache directory path
+    """
+    if env_value:
+        cache_path = Path(env_value).expanduser().resolve()
+    else:
+        # Default to user cache directory
+        if sys.platform == "win32":
+            base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+        elif sys.platform == "darwin":
+            base = Path.home() / "Library" / "Caches"
+        else:
+            base = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+        cache_path = base / "ghostgpu"
+
+    return cache_path
+
+
+# Global instance will be initialized after GhostGPU class definition
 _ghost_instance: Optional[GhostGPU] = None
-
-def _get_instance() -> GhostGPU:
-    """Get singleton instance of GhostGPU"""
-    global _ghost_instance
-    if _ghost_instance is None:
-        _ghost_instance = GhostGPU()
-    return _ghost_instance
-
-# --- Public API Wrappers ---
-def array(data, dtype=None): return _get_instance().array(data, dtype)
-def reshape(a, new_shape): return _get_instance().reshape(a, new_shape)
-def tile(a, reps): return _get_instance().tile(a, reps)
-def repeat(a, repeats, axis=None): return _get_instance().repeat(a, repeats, axis)
-def clip(a, a_min, a_max): return _get_instance().clip(a, a_min, a_max)
-def roll(a, shift, axis=None): return _get_instance().roll(a, shift, axis)
-def flip(a, axis=None): return _get_instance().flip(a, axis)
-def maximum(a, b): return _get_instance().maximum(a, b)
-def minimum(a, b): return _get_instance().minimum(a, b)
-def where(condition, x, y): return _get_instance().where(condition, x, y)
-def all(a, axis=None, keepdims=False): return _get_instance().all(a, axis, keepdims)
-def any(a, axis=None, keepdims=False): return _get_instance().any(a, axis, keepdims)
-def interp(x, xp, fp, left=None, right=None, period=None): return _get_instance().interp(x, xp, fp, left, right, period)
-def gradient(f, *varargs, axis=None, edge_order=1): return _get_instance().gradient(f, *varargs, axis=axis, edge_order=edge_order)
-def trapz(y, x=None, dx=1.0, axis=-1): return _get_instance().trapz(y, x, dx, axis)
-def cumsum(a, axis=None, dtype=None): return _get_instance().cumsum(a, axis, dtype)
-def cumprod(a, axis=None, dtype=None): return _get_instance().cumprod(a, axis, dtype)
-def diff(a, n=1, axis=-1, prepend=None, append=None): return _get_instance().diff(a, n, axis, prepend, append)
-def std(a, axis=None, keepdims=False): return _get_instance().std(a, axis, keepdims)
-def var(a, axis=None, keepdims=False): return _get_instance().var(a, axis, keepdims)
-def unique(ar, return_index=False, return_inverse=False, return_counts=False, axis=None, equal_nan=True): return _get_instance().unique(ar, return_index, return_inverse, return_counts, axis, equal_nan)
-def save(file, arr, allow_pickle=True, fix_imports=True): return _get_instance().save(file, arr, allow_pickle, fix_imports)
-def load(file, mmap_mode=None, allow_pickle=False, fix_imports=True, encoding='ASCII'): return _get_instance().load(file, mmap_mode, allow_pickle, fix_imports, encoding)
-def linspace(start, stop, num=50, endpoint=True, dtype=None): return _get_instance().linspace(start, stop, num, endpoint, dtype)
-def arange(start=None, stop=None, step=1, dtype=None): return _get_instance().arange(start, stop, step, dtype)
-def sort(a, axis=-1, kind='quicksort', order=None): return _get_instance().sort(a, axis, kind, order)
-def argsort(a, axis=-1, kind='quicksort', order=None): return _get_instance().argsort(a, axis, kind, order)
-def argmax(a, axis=None, keepdims=False): return _get_instance().argmax(a, axis, keepdims)
-def argmin(a, axis=None, keepdims=False): return _get_instance().argmin(a, axis, keepdims)
-
-# Nested random module
-random = _get_instance().random
 
 
 # Maximum memory allocation to prevent DoS (default: 8GB)
@@ -2285,7 +2327,7 @@ class GhostGPULogger:
         # File handler with rotation
         log_file = CACHE_DIR / 'ghostgpu.log'
         try:
-            file_handler = logging.handlers.RotatingFileHandler(
+            file_handler = logging_handlers.RotatingFileHandler(
                 log_file,
                 maxBytes=10*1024*1024,  # 10MB
                 backupCount=5,
@@ -4702,61 +4744,45 @@ class ThreadSafeContext:
             except Exception as e:
                 logger.error(f"asarray conversion failed: {e}")
                 raise
-                        arr = source.copy()
-                    return self._wrap_array(arr, tag='asarray_copy')
 
-                # For non-ManagedArray inputs, use asarray (avoids copy) unless copy=True
-                def linspace(start, stop, num=50, endpoint=True, dtype=None):
+    def linspace(start, stop, num=50, endpoint=True, dtype=None):
+        """
+        Return evenly spaced numbers over a specified interval.
 
-    Parameters
-    ----------
-    start : number, optional
-        Start of interval. The interval includes this value. The default start value is 0.
-    stop : number
-        End of interval. The interval does not include this value, except in some
-        cases where `step` is not an integer and floating point round-off affects the length.
-    step : number, optional
-        Spacing between values. For any output `out`, this is the distance between two
-        adjacent values, `out[i+1] - out[i]`. The default step size is 1.
-    dtype : dtype, optional
-        The type of the output array. If `dtype` is not given, infer the data type from
-        the other input arguments.
+        Parameters
+        ----------
+        start : number
+            The starting value of the sequence.
+        stop : number
+            The end value of the sequence, unless `endpoint` is False.
+            In that case, the sequence consists of all but the last of ``num + 1``
+            evenly spaced samples, so that `stop` is excluded.
+        num : int, optional
+            Number of samples to generate. Default is 50. Must be non-negative.
+        endpoint : bool, optional
+            If True, `stop` is the last sample. Otherwise, it is not included.
+            Default is True.
+        dtype : dtype, optional
+            The type of the output array. If `dtype` is not given, infer the data type from
+            the other input arguments.
 
-    Returns
-    -------
-    arange : GhostArray
-        Array of evenly spaced values.
-    """
-    if start is None and stop is None:
-        raise ValueError("At least one of start or stop must be provided")
+        Returns
+        -------
+        samples : GhostArray
+            `num` equally spaced samples in the closed interval
+            ``[start, stop]`` or the half-open interval ``[start, stop)``
+            (depending on whether `endpoint` is True or False).
+        """
+        with self._operation_context('linspace'):
+            if not isinstance(num, int) or num < 0:
+                raise ValueError(f"Number of samples must be non-negative integer; got {num}")
 
-    if stop is None:
-        # arange(stop) -> arange(0, stop)
-        stop = start
-        start = 0
+            _validate_numeric_input(start, "start")
+            _validate_numeric_input(stop, "stop")
 
-    _validate_numeric_input(start, "start")
-    _validate_numeric_input(stop, "stop")
-    _validate_numeric_input(step, "step")
-
-    if step == 0:
-        raise ValueError("step cannot be zero")
-
-    # Use numpy's arange for reliable implementation
-    np_result = np.arange(start, stop, step, dtype=dtype)
-    return array(np_result, dtype=dtype)
-
-                arr = np.asarray(data, dtype=dtype)
-                if copy and not isinstance(data, np.ndarray):
-                    # asarray already made a copy from non-ndarray
-                    pass
-                elif copy:
-                    arr = arr.copy()
-                return self._wrap_array(arr, tag='asarray')
-
-            except Exception as e:
-                logger.error(f"asarray conversion failed: {e}")
-                raise
+            # Use numpy's linspace for reliable implementation
+            np_result = np.linspace(start, stop, num=num, endpoint=endpoint, dtype=dtype)
+            return self._wrap_array(np_result, tag='linspace')
 
     def zeros(self, shape, dtype=np.float32):
         """Create zero-filled managed array; invoke release() after use"""
@@ -5101,7 +5127,7 @@ class ThreadSafeContext:
             return self._wrap_array(result, tag='linear')
 
     def conv2d(self, x, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
-        """2D convolution"""
+        """Two-dimensional convolution"""
         with self._operation_context('conv2d'):
             x_np = np.asarray(x)
             weight_np = np.asarray(weight)
@@ -5147,7 +5173,7 @@ class ThreadSafeContext:
             return self._wrap_array(output, tag='conv2d')
 
     def max_pool2d(self, x, kernel_size, stride=None, padding=0):
-        """2D max pooling"""
+        """Two-dimensional max pooling"""
         with self._operation_context('max_pool2d'):
             x_np = np.asarray(x)
 
@@ -5189,7 +5215,7 @@ class ThreadSafeContext:
             return self._wrap_array(output, tag='max_pool2d')
 
     def avg_pool2d(self, x, kernel_size, stride=None, padding=0):
-        """2D average pooling"""
+        """Two-dimensional average pooling"""
         with self._operation_context('avg_pool2d'):
             x_np = np.asarray(x)
 
@@ -6193,20 +6219,20 @@ class ThreadSafeContext:
         """
         Compile a computation graph for optimized execution
 
-    Args:
-        graph: Computation graph to compile
-        target_backend: Target backend ('cpu', 'cuda', 'rocm', etc.)
+        Args:
+            graph: Computation graph to compile
+            target_backend: Target backend ('cpu', 'cuda', 'rocm', etc.)
 
-    Returns:
-        Compiled graph ready for execution
-    """
-    if target_backend is None:
-        target_backend = self.select_backend().name
+        Returns:
+            Compiled graph ready for execution
+        """
+        if target_backend is None:
+            target_backend = self.select_backend().name
 
-    with self._operation_context('graph_compilation'):
-        compiled_graph = graph.compile(target_backend)
-        logger.info(f"✓ Computation graph compiled for {target_backend} backend")
-        return compiled_graph
+        with self._operation_context('graph_compilation'):
+            compiled_graph = graph.compile(target_backend)
+            logger.info(f"✓ Computation graph compiled for {target_backend} backend")
+            return compiled_graph
 
     def execute_graph(self, compiled_graph: CompiledGraph, inputs: Dict[str, np.ndarray],
                      parameters: Dict[str, np.ndarray] = None) -> Dict[str, np.ndarray]:
@@ -8734,15 +8760,15 @@ def linear(x, weight, bias=None):
     return _get_instance().linear(x, weight, bias)
 
 def conv2d(x, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
-    """2D convolution"""
+    """Two-dimensional convolution"""
     return _get_instance().conv2d(x, weight, bias, stride, padding, dilation, groups)
 
 def max_pool2d(x, kernel_size, stride=None, padding=0):
-    """2D max pooling"""
+    """Two-dimensional max pooling"""
     return _get_instance().max_pool2d(x, kernel_size, stride, padding)
 
 def avg_pool2d(x, kernel_size, stride=None, padding=0):
-    """2D average pooling"""
+    """Two-dimensional average pooling"""
     return _get_instance().avg_pool2d(x, kernel_size, stride, padding)
 
 def flatten(x, start_dim=1):
@@ -8995,7 +9021,7 @@ def argmin(a, axis=None):
     return _get_instance().argmin(a, axis)
 
 def convolve(a, kernel, mode='same'):
-    """1D convolution"""
+    """One-dimensional convolution"""
     return _get_instance().convolve(a, kernel, mode)
 
 def correlate(a, kernel, mode='same'):
@@ -9653,6 +9679,143 @@ Examples:
         return 1
     finally:
         cleanup()
+
+
+# ===== Initialization and Public API =====
+
+def _get_instance() -> GhostGPU:
+    """Get singleton instance of GhostGPU"""
+    global _ghost_instance
+    if _ghost_instance is None:
+        _ghost_instance = GhostGPU()
+    return _ghost_instance
+
+
+# Public API Wrappers
+def array(data, dtype=None):
+    """Create array"""
+    return _get_instance().array(data, dtype)
+
+
+def zeros(shape, dtype=None):
+    """Create zeros array"""
+    return _get_instance().zeros(shape, dtype)
+
+
+def ones(shape, dtype=None):
+    """Create ones array"""
+    return _get_instance().ones(shape, dtype)
+
+
+def empty(shape, dtype=None):
+    """Create empty array"""
+    return _get_instance().empty(shape, dtype)
+
+
+def full(shape, fill_value, dtype=None):
+    """Create filled array"""
+    return _get_instance().full(shape, fill_value, dtype)
+
+
+def reshape(a, new_shape):
+    """Reshape array"""
+    return _get_instance().reshape(a, new_shape)
+
+
+def add(a, b):
+    """Element-wise addition"""
+    return _get_instance().add(a, b)
+
+
+def subtract(a, b):
+    """Element-wise subtraction"""
+    return _get_instance().subtract(a, b)
+
+
+def multiply(a, b):
+    """Element-wise multiplication"""
+    return _get_instance().multiply(a, b)
+
+
+def divide(a, b):
+    """Element-wise division"""
+    return _get_instance().divide(a, b)
+
+
+def matmul(a, b):
+    """Matrix multiplication"""
+    return _get_instance().matmul(a, b)
+
+
+def dot(a, b):
+    """Dot product"""
+    return _get_instance().dot(a, b)
+
+
+def sum(a, axis=None, keepdims=False):
+    """Sum reduction"""
+    return _get_instance().sum(a, axis, keepdims)
+
+
+def mean(a, axis=None, keepdims=False):
+    """Mean reduction"""
+    return _get_instance().mean(a, axis, keepdims)
+
+
+def std(a, axis=None, keepdims=False):
+    """Standard deviation"""
+    return _get_instance().std(a, axis, keepdims)
+
+
+def var(a, axis=None, keepdims=False):
+    """Variance"""
+    return _get_instance().var(a, axis, keepdims)
+
+
+def transpose(a, axes=None):
+    """Transpose array"""
+    return _get_instance().transpose(a, axes)
+
+
+def linspace(start, stop, num=50, endpoint=True, dtype=None):
+    """Create linearly spaced array"""
+    return _get_instance().linspace(start, stop, num, endpoint, dtype)
+
+
+def arange(start=None, stop=None, step=1, dtype=None):
+    """Create array with evenly spaced values"""
+    return _get_instance().arange(start, stop, step, dtype)
+
+
+def sort(a, axis=-1, kind='quicksort', order=None):
+    """Sort array"""
+    return _get_instance().sort(a, axis, kind, order)
+
+
+def argsort(a, axis=-1, kind='quicksort', order=None):
+    """Get sort indices"""
+    return _get_instance().argsort(a, axis, kind, order)
+
+
+def argmax(a, axis=None, keepdims=False):
+    """Get index of maximum"""
+    return _get_instance().argmax(a, axis, keepdims)
+
+
+def argmin(a, axis=None, keepdims=False):
+    """Get index of minimum"""
+    return _get_instance().argmin(a, axis, keepdims)
+
+
+# Random module
+class _RandomWrapper:
+    """Lazy wrapper for random module"""
+    def __getattr__(self, name):
+        return getattr(_get_instance().random, name)
+
+
+random = _RandomWrapper()
+
 
 if __name__ == '__main__':
     main()
